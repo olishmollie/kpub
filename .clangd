@@ -1,0 +1,9 @@
+CompileFlags:
+  Add: -Wno-unknown-warning-option
+  Remove:
+    - -mindirect-branch*
+    - -fno-allow-store-data-races
+    - -mpreferred-stack-boundary*
+    - -mrecord-mcount
+    - -fconserve-stack
+    - -fsanitize=bounds-strict
