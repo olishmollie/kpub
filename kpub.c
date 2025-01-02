@@ -12,20 +12,20 @@
 #include <linux/wait.h>
 
 #define NUM_TOPICS 256
-#define MAX_STR_LEN 256
+#define MAX_STR_LEN 63
 #define MAX_BUF_SIZE PAGE_SIZE
 
 struct topic {
-	wait_queue_head_t inq, outq;
-	size_t size;
+	size_t msg_size, msg_count;
 	size_t nreaders, nwriters;
-	size_t wp;
+	size_t wp, rp, len, rcount;
 	char *buf;
 	char name[MAX_STR_LEN];
 	struct device dev;
 	struct cdev cdev;
 	struct list_head entry;
-	struct semaphore sem;
+	struct mutex mtx;
+	wait_queue_head_t inq, outq;
 };
 
 #define cdev_to_topic(ptr) container_of(ptr, struct topic, cdev);
@@ -34,6 +34,9 @@ struct topic {
 
 /* Stores all topics. */
 LIST_HEAD(topics);
+
+/* Protects topic creation. */
+static DEFINE_MUTEX(topic_mtx);
 
 /* Represents the class under sysfs. */
 static struct class kpub_class;
@@ -60,19 +63,91 @@ static ssize_t name_show(struct device *dev, struct device_attribute *attr,
 	return len;
 }
 
-/* Read the topic buffer size. */
-static ssize_t size_show(struct device *dev, struct device_attribute *attr,
-			 char *buf)
+/* Read the topic message size. */
+static ssize_t msg_size_show(struct device *dev, struct device_attribute *attr,
+			     char *buf)
 {
 	struct topic *topic = dev_to_topic(dev);
-	return snprintf(buf, MAX_STR_LEN, "%lu", topic->size);
+	return snprintf(buf, MAX_STR_LEN, "%lu", topic->msg_size);
+}
+
+/* Store the topic message size. */
+static ssize_t msg_size_store(struct device *dev, struct device_attribute *attr,
+			      const char *buf, size_t len)
+{
+	struct topic *topic = dev_to_topic(dev);
+	int err;
+
+	if (mutex_lock_interruptible(&topic->mtx))
+		return -ERESTARTSYS;
+
+	if (topic->nreaders || topic->nwriters) {
+		dev_err(&topic->dev,
+			"cannot modify buffers with open file descriptors\n");
+		len = -EINVAL;
+		goto cleanup;
+	}
+
+	err = kstrtoul(buf, 10, &topic->msg_size);
+	if (err < 0) {
+		len = err;
+		goto cleanup;
+	}
+
+	dev_info(&topic->dev, "message size set to %lu bytes\n",
+		 topic->msg_size);
+
+cleanup:
+	mutex_unlock(&topic->mtx);
+	return len;
+}
+
+/* Read the topic message count. */
+static ssize_t msg_count_show(struct device *dev, struct device_attribute *attr,
+			      char *buf)
+{
+	struct topic *topic = dev_to_topic(dev);
+	return snprintf(buf, MAX_STR_LEN, "%lu", topic->msg_count);
+}
+
+/* Store the topic message count. */
+static ssize_t msg_count_store(struct device *dev,
+			       struct device_attribute *attr, const char *buf,
+			       size_t len)
+{
+	struct topic *topic = dev_to_topic(dev);
+	int err;
+
+	if (mutex_lock_interruptible(&topic->mtx))
+		return -ERESTARTSYS;
+
+	if (topic->nreaders || topic->nwriters) {
+		dev_err(&topic->dev,
+			"cannot modify buffers with open file descriptors\n");
+		len = -EINVAL;
+		goto cleanup;
+	}
+
+	err = kstrtoul(buf, 10, &topic->msg_count);
+	if (err < 0) {
+		len = err;
+		goto cleanup;
+	}
+
+	dev_info(&topic->dev, "message count set to %lu\n", topic->msg_count);
+
+cleanup:
+	mutex_unlock(&topic->mtx);
+	return len;
 }
 
 DEVICE_ATTR_RO(name);
-DEVICE_ATTR_RO(size);
+DEVICE_ATTR(msg_size, 0644, msg_size_show, msg_size_store);
+DEVICE_ATTR(msg_count, 0644, msg_count_show, msg_count_store);
 static struct attribute *topic_attrs[] = {
 	&dev_attr_name.attr,
-	&dev_attr_size.attr,
+	&dev_attr_msg_size.attr,
+	&dev_attr_msg_count.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(topic);
@@ -124,22 +199,18 @@ static ssize_t create_topic_store(const struct class *cp,
 		return -EINVAL;
 	}
 
+	if (mutex_lock_interruptible(&topic_mtx))
+		return -ERESTARTSYS;
+
 	topic = (struct topic *)kzalloc(sizeof(*topic), GFP_KERNEL);
 	if (!topic)
 		return -ENOMEM;
 
-	topic->size = 9;
 	memcpy(topic->name, buf, len);
 
-	sema_init(&topic->sem, 1);
+	mutex_init(&topic->mtx);
 	init_waitqueue_head(&topic->inq);
 	init_waitqueue_head(&topic->outq);
-
-	topic->buf = (char *)kzalloc(topic->size, GFP_KERNEL);
-	if (!topic->buf) {
-		err = -ENOMEM;
-		goto cleanup_topic;
-	}
 
 	minor_num = reserve_minor_num();
 	if (minor_num < 0) {
@@ -182,14 +253,13 @@ static ssize_t create_topic_store(const struct class *cp,
 
 	list_add(&topic->entry, &topics);
 
-	pr_info("%s: created topic '%s'\n", THIS_MODULE->name, topic->name);
+	mutex_unlock(&topic_mtx);
 
 	return len;
 
 cleanup_cdev:
 	cdev_del(&topic->cdev);
 cleanup_topic:
-	kfree(topic->buf);
 	kfree(topic);
 
 	return err;
@@ -214,8 +284,14 @@ static ssize_t remove_topic_store(const struct class *cls,
 	struct topic *topic = NULL, *tp;
 	struct list_head *node;
 
-	if (len >= MAX_STR_LEN)
+	if (len >= MAX_STR_LEN) {
+		pr_alert("%s: topic too long, max %d bytes\n",
+			 THIS_MODULE->name, MAX_STR_LEN);
 		return -EINVAL;
+	}
+
+	if (mutex_lock_interruptible(&topic_mtx))
+		return -ERESTARTSYS;
 
 	list_for_each(node, &topics) {
 		tp = node_to_topic(node);
@@ -225,12 +301,14 @@ static ssize_t remove_topic_store(const struct class *cls,
 		}
 	}
 
-	if (!topic)
+	if (!topic) {
+		mutex_unlock(&topic_mtx);
 		return -ENODEV;
+	}
 
 	delete_topic(topic);
 
-	pr_info("%s: removed topic '%s'\n", THIS_MODULE->name, buf);
+	mutex_unlock(&topic_mtx);
 
 	return len;
 }
@@ -261,26 +339,48 @@ static int kpub_open(struct inode *inode, struct file *file)
 	struct topic *topic = cdev_to_topic(inode->i_cdev);
 	int err = 0;
 
-	if (down_interruptible(&topic->sem))
+	if (mutex_lock_interruptible(&topic->mtx))
 		return -ERESTARTSYS;
 
 	file->private_data = topic;
+
+	if (topic->msg_size == 0 || topic->msg_count == 0) {
+		dev_err(&topic->dev,
+			"set msg_size and msg_count before opening\n");
+		err = -ENOMEM;
+		goto cleanup;
+	}
+
+	if (!topic->buf) {
+		topic->buf = (char *)kzalloc(topic->msg_size * topic->msg_count,
+					     GFP_KERNEL);
+		if (!topic->buf) {
+			err = -ENOMEM;
+			goto cleanup;
+		}
+	}
 
 	if (file->f_mode & FMODE_READ && !(file->f_mode & FMODE_WRITE)) {
 		++topic->nreaders;
 	} else if (file->f_mode & FMODE_WRITE && !(file->f_mode & FMODE_READ)) {
 		++topic->nwriters;
-		wake_up_interruptible(&topic->inq);
 	} else {
 		dev_err(&topic->dev,
 			"topic must be opened as reader xor writer");
 		err = -EACCES;
+		goto cleanup;
 	}
 
-	dev_info(&topic->dev, "updating file pos...\n");
-	file->f_pos = topic->wp;
+	topic->rp = topic->wp;
+	topic->len = 0;
 
-	up(&topic->sem);
+	dev_info(
+		&topic->dev,
+		"opening new file, nreaders = %lu, nwriters = %lu, offset = %lld\n",
+		topic->nreaders, topic->nwriters, file->f_pos);
+
+cleanup:
+	mutex_unlock(&topic->mtx);
 
 	return err;
 }
@@ -290,11 +390,10 @@ static int kpub_release(struct inode *inode, struct file *file)
 	struct topic *topic = cdev_to_topic(inode->i_cdev);
 	int err = 0;
 
-	if (down_interruptible(&topic->sem))
+	if (mutex_lock_interruptible(&topic->mtx))
 		return -ERESTARTSYS;
 
 	file->private_data = topic;
-	dev_info(&topic->dev, "closing topic '%s'\n", topic->name);
 
 	if (file->f_mode & FMODE_READ && !(file->f_mode & FMODE_WRITE)) {
 		--topic->nreaders;
@@ -306,7 +405,7 @@ static int kpub_release(struct inode *inode, struct file *file)
 		err = -EACCES;
 	}
 
-	up(&topic->sem);
+	mutex_unlock(&topic->mtx);
 
 	return err;
 }
@@ -315,93 +414,121 @@ static ssize_t kpub_read(struct file *file, char __user *buf, size_t len,
 			 loff_t *off)
 {
 	struct topic *topic = file->private_data;
+	size_t size = topic->msg_size * topic->msg_count;
 
-	if (down_interruptible(&topic->sem))
+	if (mutex_lock_interruptible(&topic->mtx))
 		return -ERESTARTSYS;
 
-	dev_info(&topic->dev, "%s sleeping...\n", topic->name);
-	while (topic->wp == *off) {
-		up(&topic->sem);
+	dev_info(&topic->dev, "reader is going to sleep...\n");
+	while (topic->len == 0) {
+		mutex_unlock(&topic->mtx);
 		if (file->f_flags & O_NONBLOCK)
 			return -EAGAIN;
-		if (wait_event_interruptible(topic->inq, (topic->wp != *off)))
+		if (wait_event_interruptible(topic->inq, topic->len > 0))
 			return -ERESTARTSYS;
-		if (down_interruptible(&topic->sem))
+		if (mutex_lock_interruptible(&topic->mtx))
 			return -ERESTARTSYS;
 	}
 
-	dev_info(&topic->dev, "info to read!\n");
+	dev_info(&topic->dev, "reader has woken up!\n");
 
-	if (topic->wp > *off)
-		len = min(len, (size_t)(topic->wp - *off));
+	if (topic->wp > topic->rp)
+		len = min(len, (size_t)(topic->wp - topic->rp));
 	else
-		len = min(len, (size_t)(topic->size - *off));
+		len = min(len, (size_t)(size - topic->rp));
 
-	dev_info(&topic->dev, "copying %lu bytes to buffer\n", len);
-	if (copy_to_user(buf, &topic->buf[*off], len))
+	char test[MAX_STR_LEN];
+	snprintf(test, len, "%s", &topic->buf[*off]);
+	dev_info(&topic->dev,
+		 "copying %lu bytes to user space starting at %lu: %s\n", len,
+		 topic->rp, test);
+	if (copy_to_user(buf, &topic->buf[topic->rp], len)) {
+		mutex_unlock(&topic->mtx);
 		return -EFAULT;
+	}
 
-	*off += len;
-	if (*off >= topic->size)
-		*off = 0;
+	--topic->rcount;
+	if (topic->rcount == 0) {
+		topic->rp += len;
+		if (topic->rp == size)
+			topic->rp = 0;
+		topic->len -= len;
+	}
 
-	up(&topic->sem);
+	dev_info(
+		&topic->dev,
+		"read: len = %lu, topic->rp = %lu, topic->len = %lu, topic->rcount = %lu\n",
+		len, topic->rp, topic->len, topic->rcount);
+
+	if (topic->len > 6) {
+		mutex_unlock(&topic->mtx);
+		return -EINVAL;
+	}
+
+	mutex_unlock(&topic->mtx);
 
 	wake_up_interruptible(&topic->outq);
 
 	return len;
 }
 
-/* Return the number of bytes available to be written to. */
-static size_t bytes_to_write(struct topic *topic, loff_t *off)
-{
-	if (topic->wp == *off)
-		return topic->size - 1;
-	if (topic->wp > *off)
-		return topic->wp - *off;
-	return topic->size + topic->wp - *off;
-}
-
 static ssize_t kpub_write(struct file *file, const char __user *buf, size_t len,
 			  loff_t *off)
 {
 	struct topic *topic = file->private_data;
+	size_t size = topic->msg_size * topic->msg_count;
 
-	if (len > topic->size) {
-		dev_err(&topic->dev, "%lu byte message is too large\n", len);
+	if (len % topic->msg_size) {
+		dev_err(&topic->dev,
+			"write length must be a multiple of msg_size\n");
 		return -EINVAL;
 	}
 
-	if (down_interruptible(&topic->sem))
+	if (len > size) {
+		dev_err(&topic->dev,
+			"cannot write more than msg_count messages\n");
+		return -EINVAL;
+	}
+
+	if (mutex_lock_interruptible(&topic->mtx))
 		return -ERESTARTSYS;
 
-	while (bytes_to_write(topic, off) == 0) {
-		up(&topic->sem);
+	while (topic->len == size) {
+		mutex_unlock(&topic->mtx);
 		if (file->f_flags & O_NONBLOCK)
 			return -EAGAIN;
-		if (wait_event_interruptible(topic->outq,
-					     (bytes_to_write(topic, off) > 0)))
+		if (wait_event_interruptible(topic->outq, topic->len < size))
 			return -ERESTARTSYS;
-		if (down_interruptible(&topic->sem))
+		if (mutex_lock_interruptible(&topic->mtx))
 			return -ERESTARTSYS;
 	}
 
 	if (topic->wp >= *off)
-		len = min(len, (size_t)(topic->size - topic->wp));
+		len = min(len, (size_t)(size - topic->wp));
 	else
 		len = min(len, (size_t)(*off - topic->wp));
 
-	dev_info(&topic->dev, "copying %lu bytes from buf\n", len);
+	dev_info(&topic->dev,
+		 "copying %lu bytes from user space starting at %lu\n", len,
+		 topic->wp);
 	if (copy_from_user(&topic->buf[topic->wp], buf, len)) {
-		up(&topic->sem);
+		mutex_unlock(&topic->mtx);
 		return -EFAULT;
 	}
 
 	topic->wp += len;
-	if (topic->wp == topic->size)
+	if (topic->wp == size)
 		topic->wp = 0;
+	topic->len += len;
 
-	up(&topic->sem);
+	topic->rcount = topic->nreaders;
+
+	dev_info(
+		&topic->dev,
+		"topic->len = %lu, topic->wp = %lu, topic->rcount = %lu, topic->rp = %lu\n",
+		topic->len, topic->wp, topic->rcount, topic->rp);
+
+	mutex_unlock(&topic->mtx);
 
 	wake_up_interruptible(&topic->inq);
 
@@ -411,24 +538,20 @@ static ssize_t kpub_write(struct file *file, const char __user *buf, size_t len,
 static unsigned kpub_poll(struct file *file, poll_table *ppt)
 {
 	struct topic *topic = file->private_data;
+	size_t size = topic->msg_size * topic->msg_count;
 	int ready_mask = 0;
 
-	down(&topic->sem);
-
-	if (topic->nwriters == 0) {
-		up(&topic->sem);
-		return POLLHUP;
-	}
+	mutex_lock(&topic->mtx);
 
 	poll_wait(file, &topic->inq, ppt);
 	poll_wait(file, &topic->outq, ppt);
 
-	if (file->f_pos != topic->wp)
+	if (topic->len > 0)
 		ready_mask |= (POLLIN | POLLRDNORM);
-	if (bytes_to_write(topic, &file->f_pos) > 0)
+	if (topic->len == size)
 		ready_mask |= POLLOUT | POLLWRNORM;
 
-	up(&topic->sem);
+	mutex_unlock(&topic->mtx);
 
 	return ready_mask;
 }
@@ -450,7 +573,7 @@ static int __init kpub_init(void)
 	if (err < 0) {
 		pr_alert("%s: could not allocate character device region\n",
 			 THIS_MODULE->name);
-		goto cleanup;
+		return err;
 	}
 
 	major_num = MAJOR(kpub_devt);
@@ -458,17 +581,11 @@ static int __init kpub_init(void)
 	err = class_register(&kpub_class);
 	if (err) {
 		pr_alert("%s: could not register class\n", THIS_MODULE->name);
-		goto cleanup;
+		unregister_chrdev_region(kpub_devt, NUM_TOPICS);
+		return err;
 	}
 
-	pr_info("%s: initialized module\n", THIS_MODULE->name);
-
 	return 0;
-
-cleanup:
-	unregister_chrdev_region(kpub_devt, NUM_TOPICS);
-
-	return err;
 }
 
 static void __exit kpub_exit(void)
@@ -478,14 +595,11 @@ static void __exit kpub_exit(void)
 
 	list_for_each_safe(node, tmp, &topics) {
 		topic = node_to_topic(node);
-		pr_info("%s: removing topic '%s'\n", THIS_MODULE->name,
-			topic->name);
 		delete_topic(topic);
 	}
 
 	class_unregister(&kpub_class);
 	unregister_chrdev_region(kpub_devt, NUM_TOPICS);
-	pr_info("%s: removed module\n", THIS_MODULE->name);
 }
 
 module_init(kpub_init);
@@ -493,4 +607,4 @@ module_exit(kpub_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Andy Bond (olishmollie@gmail.com)");
-MODULE_DESCRIPTION("A device-based pub/sub framework.");
+MODULE_DESCRIPTION("A character device based pub/sub framework.");
