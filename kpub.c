@@ -16,6 +16,7 @@
 #define MAX_BUF_SIZE PAGE_SIZE
 #define MAX_MSG_SIZE PAGE_SIZE
 #define MAX_MSG_COUNT 64
+#define DEFAULT_RCOUNT 1000
 
 struct topic {
 	uint32_t msg_size, msg_count;
@@ -259,6 +260,9 @@ static ssize_t create_topic_store(const struct class *cp,
 	topic->dev.devt = devt;
 	topic->dev.id = minor_num;
 
+	// TODO: What's a good value here?
+	topic->rcount = DEFAULT_RCOUNT;
+
 	err = device_register(&topic->dev);
 	if (err) {
 		pr_alert("%s: could not add device '%s'\n", THIS_MODULE->name,
@@ -435,6 +439,12 @@ static ssize_t kpub_read(struct file *file, char __user *buf, size_t len,
 
 	if (mutex_lock_interruptible(&topic->mtx))
 		return -ERESTARTSYS;
+
+	if (topic->rcount == 0 && topic->nwriters == 0) {
+		topic->rcount = DEFAULT_RCOUNT;
+		mutex_unlock(&topic->mtx);
+		return 0;
+	}
 
 	dev_info(&topic->dev, "reader is going to sleep...\n");
 	while (topic->len == 0) {
