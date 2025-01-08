@@ -12,13 +12,15 @@
 #include <linux/wait.h>
 
 #define NUM_TOPICS 256
-#define MAX_STR_LEN 63
+#define MAX_STR_LEN 64
 #define MAX_BUF_SIZE PAGE_SIZE
+#define MAX_MSG_SIZE PAGE_SIZE
+#define MAX_MSG_COUNT 64
 
 struct topic {
-	size_t msg_size, msg_count;
-	size_t nreaders, nwriters;
-	size_t wp, rp, len, rcount;
+	uint32_t msg_size, msg_count;
+	uint32_t nreaders, nwriters;
+	uint32_t wp, rp, len, rcount;
 	char *buf;
 	char name[MAX_STR_LEN];
 	struct device dev;
@@ -68,7 +70,7 @@ static ssize_t msg_size_show(struct device *dev, struct device_attribute *attr,
 			     char *buf)
 {
 	struct topic *topic = dev_to_topic(dev);
-	return snprintf(buf, MAX_STR_LEN, "%lu", topic->msg_size);
+	return snprintf(buf, MAX_STR_LEN, "%u", topic->msg_size);
 }
 
 /* Store the topic message size. */
@@ -76,7 +78,11 @@ static ssize_t msg_size_store(struct device *dev, struct device_attribute *attr,
 			      const char *buf, size_t len)
 {
 	struct topic *topic = dev_to_topic(dev);
-	int err;
+
+	if (len > sizeof(topic->msg_size)) {
+		dev_err(&topic->dev, "msg_size too big\n");
+		return -EINVAL;
+	}
 
 	if (mutex_lock_interruptible(&topic->mtx))
 		return -ERESTARTSYS;
@@ -88,13 +94,17 @@ static ssize_t msg_size_store(struct device *dev, struct device_attribute *attr,
 		goto cleanup;
 	}
 
-	err = kstrtoul(buf, 10, &topic->msg_size);
-	if (err < 0) {
-		len = err;
+	topic->msg_size = *(uint32_t *)buf;
+	if (topic->msg_size > MAX_MSG_SIZE) {
+		topic->msg_size = 0;
+		len = -EINVAL;
+		dev_err(&topic->dev,
+			"msg_size (%u) must be less than MAX_MSG_SIZE (%lu)\n",
+			topic->msg_size, MAX_MSG_SIZE);
 		goto cleanup;
 	}
 
-	dev_info(&topic->dev, "message size set to %lu bytes\n",
+	dev_info(&topic->dev, "message size set to %u bytes\n",
 		 topic->msg_size);
 
 cleanup:
@@ -107,7 +117,7 @@ static ssize_t msg_count_show(struct device *dev, struct device_attribute *attr,
 			      char *buf)
 {
 	struct topic *topic = dev_to_topic(dev);
-	return snprintf(buf, MAX_STR_LEN, "%lu", topic->msg_count);
+	return snprintf(buf, MAX_STR_LEN, "%u", topic->msg_count);
 }
 
 /* Store the topic message count. */
@@ -116,7 +126,11 @@ static ssize_t msg_count_store(struct device *dev,
 			       size_t len)
 {
 	struct topic *topic = dev_to_topic(dev);
-	int err;
+
+	if (len > sizeof(topic->msg_count)) {
+		dev_err(&topic->dev, "msg_count too big\n");
+		return -EINVAL;
+	}
 
 	if (mutex_lock_interruptible(&topic->mtx))
 		return -ERESTARTSYS;
@@ -128,13 +142,14 @@ static ssize_t msg_count_store(struct device *dev,
 		goto cleanup;
 	}
 
-	err = kstrtoul(buf, 10, &topic->msg_count);
-	if (err < 0) {
-		len = err;
+	topic->msg_count = *(uint32_t *)buf;
+	if (topic->msg_count > MAX_MSG_COUNT) {
+		topic->msg_count = 0;
+		len = -EINVAL;
 		goto cleanup;
 	}
 
-	dev_info(&topic->dev, "message count set to %lu\n", topic->msg_count);
+	dev_info(&topic->dev, "message count set to %u\n", topic->msg_count);
 
 cleanup:
 	mutex_unlock(&topic->mtx);
@@ -142,8 +157,8 @@ cleanup:
 }
 
 DEVICE_ATTR_RO(name);
-DEVICE_ATTR(msg_size, 0644, msg_size_show, msg_size_store);
-DEVICE_ATTR(msg_count, 0644, msg_count_show, msg_count_store);
+DEVICE_ATTR(msg_size, 0664, msg_size_show, msg_size_store);
+DEVICE_ATTR(msg_count, 0664, msg_count_show, msg_count_store);
 static struct attribute *topic_attrs[] = {
 	&dev_attr_name.attr,
 	&dev_attr_msg_size.attr,
@@ -315,11 +330,13 @@ static ssize_t remove_topic_store(const struct class *cls,
 
 /*
  * Default class sysfs attributes:
- *  - create_topic
- * 	- remove_topic
+ *  - create_topic (write only)
+ * 	- remove_topic (write only)
  */
-CLASS_ATTR_WO(create_topic);
-CLASS_ATTR_WO(remove_topic);
+static struct class_attribute class_attr_create_topic =
+	__ATTR(create_topic, 0220, NULL, create_topic_store);
+static struct class_attribute class_attr_remove_topic =
+	__ATTR(remove_topic, 0220, NULL, remove_topic_store);
 static struct attribute *class_attrs[] = {
 	&class_attr_create_topic.attr,
 	&class_attr_remove_topic.attr,
@@ -376,7 +393,7 @@ static int kpub_open(struct inode *inode, struct file *file)
 
 	dev_info(
 		&topic->dev,
-		"opening new file, nreaders = %lu, nwriters = %lu, offset = %lld\n",
+		"opening new file, nreaders = %u, nwriters = %u, offset = %lld\n",
 		topic->nreaders, topic->nwriters, file->f_pos);
 
 cleanup:
@@ -440,7 +457,7 @@ static ssize_t kpub_read(struct file *file, char __user *buf, size_t len,
 	char test[MAX_STR_LEN];
 	snprintf(test, len, "%s", &topic->buf[*off]);
 	dev_info(&topic->dev,
-		 "copying %lu bytes to user space starting at %lu: %s\n", len,
+		 "copying %lu bytes to user space starting at %u: %s\n", len,
 		 topic->rp, test);
 	if (copy_to_user(buf, &topic->buf[topic->rp], len)) {
 		mutex_unlock(&topic->mtx);
@@ -457,7 +474,7 @@ static ssize_t kpub_read(struct file *file, char __user *buf, size_t len,
 
 	dev_info(
 		&topic->dev,
-		"read: len = %lu, topic->rp = %lu, topic->len = %lu, topic->rcount = %lu\n",
+		"read: len = %lu, topic->rp = %u, topic->len = %u, topic->rcount = %u\n",
 		len, topic->rp, topic->len, topic->rcount);
 
 	if (topic->len > 6) {
@@ -509,7 +526,7 @@ static ssize_t kpub_write(struct file *file, const char __user *buf, size_t len,
 		len = min(len, (size_t)(*off - topic->wp));
 
 	dev_info(&topic->dev,
-		 "copying %lu bytes from user space starting at %lu\n", len,
+		 "copying %lu bytes from user space starting at %u\n", len,
 		 topic->wp);
 	if (copy_from_user(&topic->buf[topic->wp], buf, len)) {
 		mutex_unlock(&topic->mtx);
@@ -525,7 +542,7 @@ static ssize_t kpub_write(struct file *file, const char __user *buf, size_t len,
 
 	dev_info(
 		&topic->dev,
-		"topic->len = %lu, topic->wp = %lu, topic->rcount = %lu, topic->rp = %lu\n",
+		"topic->len = %u, topic->wp = %u, topic->rcount = %u, topic->rp = %u\n",
 		topic->len, topic->wp, topic->rcount, topic->rp);
 
 	mutex_unlock(&topic->mtx);
