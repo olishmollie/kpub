@@ -1,0 +1,2 @@
+ACTION=="add", SUBSYSTEM=="kpub", GROUP="kpub", RUN="/usr/bin/chown -R root:kpub /sys$devpath"
+ACTION=="add", KERNEL=="kpub", RUN="/usr/bin/chown -R root:kpub /sys/class/kpub"
