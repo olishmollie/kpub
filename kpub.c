@@ -441,11 +441,13 @@ static ssize_t kpub_read(struct file *file, char __user *buf, size_t len,
 		mutex_unlock(&topic->mtx);
 		if (file->f_flags & O_NONBLOCK)
 			return -EAGAIN;
+		dev_info(&topic->dev, "reader 0x%8p going to sleep...\n", file);
 		if (wait_event_interruptible(topic->inq, *off != topic->wp))
 			return -ERESTARTSYS;
 		if (mutex_lock_interruptible(&topic->mtx))
 			return -ERESTARTSYS;
 	}
+	dev_info(&topic->dev, "reader 0x%8p woke up!\n", file);
 
 	if (topic->wp > *off)
 		len = min(len, (size_t)(topic->wp - *off));
@@ -503,11 +505,13 @@ static ssize_t kpub_write(struct file *file, const char __user *buf, size_t len,
 		mutex_unlock(&topic->mtx);
 		if (file->f_flags & O_NONBLOCK)
 			return -EAGAIN;
+		dev_info(&topic->dev, "writer 0x%8p going to sleep...\n", file);
 		if (wait_event_interruptible(topic->outq, topic->len < size))
 			return -ERESTARTSYS;
 		if (mutex_lock_interruptible(&topic->mtx))
 			return -ERESTARTSYS;
 	}
+	dev_info(&topic->dev, "writer 0x%8p woke up!\n", file);
 
 	if (topic->wp >= *off)
 		len = min(len, (size_t)(size - topic->wp));
