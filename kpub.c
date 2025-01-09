@@ -16,7 +16,6 @@
 #define MAX_BUF_SIZE PAGE_SIZE
 #define MAX_MSG_SIZE PAGE_SIZE
 #define MAX_MSG_COUNT 64
-#define DEFAULT_RCOUNT 1000
 
 struct topic {
 	uint32_t msg_size, msg_count;
@@ -260,9 +259,6 @@ static ssize_t create_topic_store(const struct class *cp,
 	topic->dev.devt = devt;
 	topic->dev.id = minor_num;
 
-	// TODO: What's a good value here?
-	topic->rcount = DEFAULT_RCOUNT;
-
 	err = device_register(&topic->dev);
 	if (err) {
 		pr_alert("%s: could not add device '%s'\n", THIS_MODULE->name,
@@ -392,13 +388,14 @@ static int kpub_open(struct inode *inode, struct file *file)
 		goto cleanup;
 	}
 
+	file->f_pos = topic->wp;
 	topic->rp = topic->wp;
 	topic->len = 0;
 
 	dev_info(
 		&topic->dev,
-		"opening new file, nreaders = %u, nwriters = %u, offset = %lld\n",
-		topic->nreaders, topic->nwriters, file->f_pos);
+		"opening file %8p: nreaders = %u, nwriters = %u, offset = %lld\n",
+		file, topic->nreaders, topic->nwriters, file->f_pos);
 
 cleanup:
 	mutex_unlock(&topic->mtx);
@@ -440,39 +437,31 @@ static ssize_t kpub_read(struct file *file, char __user *buf, size_t len,
 	if (mutex_lock_interruptible(&topic->mtx))
 		return -ERESTARTSYS;
 
-	if (topic->rcount == 0 && topic->nwriters == 0) {
-		topic->rcount = DEFAULT_RCOUNT;
-		mutex_unlock(&topic->mtx);
-		return 0;
-	}
-
-	dev_info(&topic->dev, "reader is going to sleep...\n");
-	while (topic->len == 0) {
+	while (*off == topic->wp) {
 		mutex_unlock(&topic->mtx);
 		if (file->f_flags & O_NONBLOCK)
 			return -EAGAIN;
-		if (wait_event_interruptible(topic->inq, topic->len > 0))
+		if (wait_event_interruptible(topic->inq, *off != topic->wp))
 			return -ERESTARTSYS;
 		if (mutex_lock_interruptible(&topic->mtx))
 			return -ERESTARTSYS;
 	}
 
-	dev_info(&topic->dev, "reader has woken up!\n");
-
-	if (topic->wp > topic->rp)
-		len = min(len, (size_t)(topic->wp - topic->rp));
+	if (topic->wp > *off)
+		len = min(len, (size_t)(topic->wp - *off));
 	else
-		len = min(len, (size_t)(size - topic->rp));
+		len = min(len, (size_t)(size - *off));
 
-	char test[MAX_STR_LEN];
-	snprintf(test, len, "%s", &topic->buf[*off]);
-	dev_info(&topic->dev,
-		 "copying %lu bytes to user space starting at %u: %s\n", len,
-		 topic->rp, test);
-	if (copy_to_user(buf, &topic->buf[topic->rp], len)) {
+	dev_info(&topic->dev, "reader 0x%8p: len = %lu, *off = %lld\n", file,
+		 len, *off);
+	if (copy_to_user(buf, &topic->buf[*off], len)) {
 		mutex_unlock(&topic->mtx);
 		return -EFAULT;
 	}
+
+	*off += len;
+	if (*off == size)
+		*off = 0;
 
 	--topic->rcount;
 	if (topic->rcount == 0) {
@@ -480,16 +469,6 @@ static ssize_t kpub_read(struct file *file, char __user *buf, size_t len,
 		if (topic->rp == size)
 			topic->rp = 0;
 		topic->len -= len;
-	}
-
-	dev_info(
-		&topic->dev,
-		"read: len = %lu, topic->rp = %u, topic->len = %u, topic->rcount = %u\n",
-		len, topic->rp, topic->len, topic->rcount);
-
-	if (topic->len > 6) {
-		mutex_unlock(&topic->mtx);
-		return -EINVAL;
 	}
 
 	mutex_unlock(&topic->mtx);
@@ -535,9 +514,8 @@ static ssize_t kpub_write(struct file *file, const char __user *buf, size_t len,
 	else
 		len = min(len, (size_t)(*off - topic->wp));
 
-	dev_info(&topic->dev,
-		 "copying %lu bytes from user space starting at %u\n", len,
-		 topic->wp);
+	dev_info(&topic->dev, "writer 0x%8p: len = %lu, topic->wp = %u\n", file,
+		 len, topic->wp);
 	if (copy_from_user(&topic->buf[topic->wp], buf, len)) {
 		mutex_unlock(&topic->mtx);
 		return -EFAULT;
@@ -549,11 +527,6 @@ static ssize_t kpub_write(struct file *file, const char __user *buf, size_t len,
 	topic->len += len;
 
 	topic->rcount = topic->nreaders;
-
-	dev_info(
-		&topic->dev,
-		"topic->len = %u, topic->wp = %u, topic->rcount = %u, topic->rp = %u\n",
-		topic->len, topic->wp, topic->rcount, topic->rp);
 
 	mutex_unlock(&topic->mtx);
 
