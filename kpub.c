@@ -15,12 +15,23 @@
 #define MAX_STR_LEN 64
 #define MAX_BUF_SIZE PAGE_SIZE
 #define MAX_MSG_SIZE PAGE_SIZE
-#define MAX_MSG_COUNT 64
+#define MSG_COUNT 2
 
+/*
+ * A topic of communication, represented by a device file.
+ *
+ * The pub/sub interface is defined by the `read` and `write` system
+ * calls; publishers `write` to the device and subscribers `read` from
+ * it.
+ *
+ * For multiple readers to consume the buffer, a writer caches the current
+ * number of readers who have `open`ed the file into `rcount`. Only once
+ * that number of readers has consumed the message in the buffer will the
+ * writers be free to write the next message.
+ */
 struct topic {
-	uint32_t msg_size, msg_count;
+	uint32_t msg_size, wp, len, rcount;
 	uint32_t nreaders, nwriters;
-	uint32_t wp, rp, len, rcount;
 	char *buf;
 	char name[MAX_STR_LEN];
 	struct device dev;
@@ -112,57 +123,16 @@ cleanup:
 	return len;
 }
 
-/* Read the topic message count. */
-static ssize_t msg_count_show(struct device *dev, struct device_attribute *attr,
-			      char *buf)
-{
-	struct topic *topic = dev_to_topic(dev);
-	return snprintf(buf, MAX_STR_LEN, "%u", topic->msg_count);
-}
-
-/* Store the topic message count. */
-static ssize_t msg_count_store(struct device *dev,
-			       struct device_attribute *attr, const char *buf,
-			       size_t len)
-{
-	struct topic *topic = dev_to_topic(dev);
-
-	if (len > sizeof(topic->msg_count)) {
-		dev_err(&topic->dev, "msg_count too big\n");
-		return -EINVAL;
-	}
-
-	if (mutex_lock_interruptible(&topic->mtx))
-		return -ERESTARTSYS;
-
-	if (topic->nreaders || topic->nwriters) {
-		dev_err(&topic->dev,
-			"cannot modify buffers with open file descriptors\n");
-		len = -EINVAL;
-		goto cleanup;
-	}
-
-	topic->msg_count = *(uint32_t *)buf;
-	if (topic->msg_count > MAX_MSG_COUNT) {
-		topic->msg_count = 0;
-		len = -EINVAL;
-		goto cleanup;
-	}
-
-	dev_info(&topic->dev, "message count set to %u\n", topic->msg_count);
-
-cleanup:
-	mutex_unlock(&topic->mtx);
-	return len;
-}
-
+/* Sysfs device attributes.
+ *
+ * Set/get the message size by writing/reading to the `msg_size` attribute.
+ * Get the topic name by reading from the `name` attribute.
+ */
 DEVICE_ATTR_RO(name);
 DEVICE_ATTR(msg_size, 0664, msg_size_show, msg_size_store);
-DEVICE_ATTR(msg_count, 0664, msg_count_show, msg_count_store);
 static struct attribute *topic_attrs[] = {
 	&dev_attr_name.attr,
 	&dev_attr_msg_size.attr,
-	&dev_attr_msg_count.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(topic);
@@ -291,7 +261,7 @@ static void delete_topic(struct topic *topic)
 	kfree(topic);
 }
 
-/* Remove a topic by writing its name to the class attribute. */
+/* Remove a topic and its device file. */
 static ssize_t remove_topic_store(const struct class *cls,
 				  const struct class_attribute *attr,
 				  const char *buf, size_t len)
@@ -328,10 +298,10 @@ static ssize_t remove_topic_store(const struct class *cls,
 	return len;
 }
 
-/*
- * Default class sysfs attributes:
- *  - create_topic (write only)
- * 	- remove_topic (write only)
+/* Sysfs class attributes.
+ *
+ * Create a topic by writing its name to the `create_topic` attribute.
+ * Remove a topic by writing its name to the `remove_topic` attribute.
  */
 static struct class_attribute class_attr_create_topic =
 	__ATTR(create_topic, 0220, NULL, create_topic_store);
@@ -361,15 +331,14 @@ static int kpub_open(struct inode *inode, struct file *file)
 
 	file->private_data = topic;
 
-	if (topic->msg_size == 0 || topic->msg_count == 0) {
-		dev_err(&topic->dev,
-			"set msg_size and msg_count before opening\n");
+	if (topic->msg_size == 0) {
+		dev_err(&topic->dev, "set msg_size before opening\n");
 		err = -ENOMEM;
 		goto cleanup;
 	}
 
 	if (!topic->buf) {
-		topic->buf = (char *)kzalloc(topic->msg_size * topic->msg_count,
+		topic->buf = (char *)kzalloc(topic->msg_size * MSG_COUNT,
 					     GFP_KERNEL);
 		if (!topic->buf) {
 			err = -ENOMEM;
@@ -377,13 +346,12 @@ static int kpub_open(struct inode *inode, struct file *file)
 		}
 	}
 
-	file->f_pos = topic->wp;
-	topic->rp = topic->wp;
-	topic->len = 0;
-
 	if (file->f_mode & FMODE_READ && !(file->f_mode & FMODE_WRITE)) {
 		++topic->nreaders;
+		file->f_pos = topic->wp;
+		topic->len = 0;
 	} else if (file->f_mode & FMODE_WRITE && !(file->f_mode & FMODE_READ)) {
+		// TODO: Can kpub handle more than one writer?
 		++topic->nwriters;
 	} else {
 		dev_err(&topic->dev,
@@ -392,17 +360,13 @@ static int kpub_open(struct inode *inode, struct file *file)
 		goto cleanup;
 	}
 
-	dev_info(
-		&topic->dev,
-		"opening file 0x%8p: nreaders = %u, nwriters = %u, offset = %lld\n",
-		file, topic->nreaders, topic->nwriters, file->f_pos);
-
 cleanup:
 	mutex_unlock(&topic->mtx);
 
 	return err;
 }
 
+/* Close the device file. */
 static int kpub_release(struct inode *inode, struct file *file)
 {
 	struct topic *topic = cdev_to_topic(inode->i_cdev);
@@ -423,21 +387,23 @@ static int kpub_release(struct inode *inode, struct file *file)
 		err = -EACCES;
 	}
 
-	dev_info(
-		&topic->dev,
-		"closing file 0x%8p: nreaders = %u, nwriters = %u, topic->len = %u\n",
-		file, topic->nreaders, topic->nwriters, topic->len);
-
 	mutex_unlock(&topic->mtx);
 
 	return err;
 }
 
+/*
+ * Read a message from the topic buffer.
+ *
+ * If the buffer has no message, the reader blocks, unless O_NONBLOCK is
+ * set. Only when all registered readers have consumed the message will
+ * writers be unblocked.
+ */
 static ssize_t kpub_read(struct file *file, char __user *buf, size_t len,
 			 loff_t *off)
 {
 	struct topic *topic = file->private_data;
-	size_t size = topic->msg_size * topic->msg_count;
+	size_t size = topic->msg_size * MSG_COUNT;
 
 	if (mutex_lock_interruptible(&topic->mtx))
 		return -ERESTARTSYS;
@@ -446,7 +412,6 @@ static ssize_t kpub_read(struct file *file, char __user *buf, size_t len,
 		mutex_unlock(&topic->mtx);
 		if (file->f_flags & O_NONBLOCK)
 			return -EAGAIN;
-		dev_info(&topic->dev, "reader 0x%8p going to sleep...\n", file);
 		if (wait_event_interruptible(topic->inq, *off != topic->wp))
 			return -ERESTARTSYS;
 		if (mutex_lock_interruptible(&topic->mtx))
@@ -458,10 +423,6 @@ static ssize_t kpub_read(struct file *file, char __user *buf, size_t len,
 	else
 		len = min(len, (size_t)(size - *off));
 
-	dev_info(
-		&topic->dev,
-		"reader 0x%8p woke up! len = %lu, topic->wp = %u, *off = %lld, topic->len = %u\n",
-		file, len, topic->wp, *off, topic->len);
 	if (copy_to_user(buf, &topic->buf[*off], len)) {
 		mutex_unlock(&topic->mtx);
 		return -EFAULT;
@@ -473,54 +434,48 @@ static ssize_t kpub_read(struct file *file, char __user *buf, size_t len,
 
 	--topic->rcount;
 	if (topic->rcount == 0) {
-		topic->rp += len;
-		if (topic->rp == size)
-			topic->rp = 0;
 		topic->len -= len;
+		mutex_unlock(&topic->mtx);
+		wake_up_interruptible(&topic->outq);
+	} else {
+		mutex_unlock(&topic->mtx);
 	}
-
-	mutex_unlock(&topic->mtx);
-
-	wake_up_interruptible(&topic->outq);
 
 	return len;
 }
 
+/*
+* Write a message to the topic buffer.
+*
+* If the buffer already has a message, the writer blocks. Only once all readers
+* have consumed the message will the writer be unblocked.
+*/
 static ssize_t kpub_write(struct file *file, const char __user *buf, size_t len,
 			  loff_t *off)
 {
 	struct topic *topic = file->private_data;
-	size_t size = topic->msg_size * topic->msg_count;
+	size_t size = topic->msg_size * MSG_COUNT;
 
-	if (len % topic->msg_size) {
-		dev_err(&topic->dev,
-			"write length must be a multiple of msg_size\n");
+	if (len != topic->msg_size) {
+		dev_err(&topic->dev, "write length must equal to msg_size\n");
 		return -EINVAL;
 	}
 
 	if (mutex_lock_interruptible(&topic->mtx))
 		return -ERESTARTSYS;
 
-	while (topic->len == topic->msg_size) {
+	while (topic->len > 0) {
 		mutex_unlock(&topic->mtx);
 		if (file->f_flags & O_NONBLOCK)
 			return -EAGAIN;
-		dev_info(&topic->dev, "writer 0x%8p going to sleep...\n", file);
 		if (wait_event_interruptible(topic->outq, topic->len == 0))
 			return -ERESTARTSYS;
 		if (mutex_lock_interruptible(&topic->mtx))
 			return -ERESTARTSYS;
 	}
 
-	if (topic->wp >= *off)
-		len = min(len, (size_t)(size - topic->wp));
-	else
-		len = min(len, (size_t)(*off - topic->wp));
+	len = topic->msg_size;
 
-	dev_info(
-		&topic->dev,
-		"writer 0x%8p woke up! len = %lu, topic->wp = %u, *off = %lld\n",
-		file, len, topic->wp, *off);
 	if (copy_from_user(&topic->buf[topic->wp], buf, len)) {
 		mutex_unlock(&topic->mtx);
 		return -EFAULT;
@@ -543,7 +498,7 @@ static ssize_t kpub_write(struct file *file, const char __user *buf, size_t len,
 static unsigned kpub_poll(struct file *file, poll_table *ppt)
 {
 	struct topic *topic = file->private_data;
-	size_t size = topic->msg_size * topic->msg_count;
+	size_t size = topic->msg_size * MSG_COUNT;
 	int ready_mask = 0;
 
 	mutex_lock(&topic->mtx);
