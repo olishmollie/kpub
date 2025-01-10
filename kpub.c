@@ -377,6 +377,10 @@ static int kpub_open(struct inode *inode, struct file *file)
 		}
 	}
 
+	file->f_pos = topic->wp;
+	topic->rp = topic->wp;
+	topic->len = 0;
+
 	if (file->f_mode & FMODE_READ && !(file->f_mode & FMODE_WRITE)) {
 		++topic->nreaders;
 	} else if (file->f_mode & FMODE_WRITE && !(file->f_mode & FMODE_READ)) {
@@ -388,13 +392,9 @@ static int kpub_open(struct inode *inode, struct file *file)
 		goto cleanup;
 	}
 
-	file->f_pos = topic->wp;
-	topic->rp = topic->wp;
-	topic->len = 0;
-
 	dev_info(
 		&topic->dev,
-		"opening file %8p: nreaders = %u, nwriters = %u, offset = %lld\n",
+		"opening file 0x%8p: nreaders = %u, nwriters = %u, offset = %lld\n",
 		file, topic->nreaders, topic->nwriters, file->f_pos);
 
 cleanup:
@@ -423,6 +423,11 @@ static int kpub_release(struct inode *inode, struct file *file)
 		err = -EACCES;
 	}
 
+	dev_info(
+		&topic->dev,
+		"closing file 0x%8p: nreaders = %u, nwriters = %u, topic->len = %u\n",
+		file, topic->nreaders, topic->nwriters, topic->len);
+
 	mutex_unlock(&topic->mtx);
 
 	return err;
@@ -447,15 +452,16 @@ static ssize_t kpub_read(struct file *file, char __user *buf, size_t len,
 		if (mutex_lock_interruptible(&topic->mtx))
 			return -ERESTARTSYS;
 	}
-	dev_info(&topic->dev, "reader 0x%8p woke up!\n", file);
 
 	if (topic->wp > *off)
 		len = min(len, (size_t)(topic->wp - *off));
 	else
 		len = min(len, (size_t)(size - *off));
 
-	dev_info(&topic->dev, "reader 0x%8p: len = %lu, *off = %lld\n", file,
-		 len, *off);
+	dev_info(
+		&topic->dev,
+		"reader 0x%8p woke up! len = %lu, topic->wp = %u, *off = %lld, topic->len = %u\n",
+		file, len, topic->wp, *off, topic->len);
 	if (copy_to_user(buf, &topic->buf[*off], len)) {
 		mutex_unlock(&topic->mtx);
 		return -EFAULT;
@@ -492,34 +498,29 @@ static ssize_t kpub_write(struct file *file, const char __user *buf, size_t len,
 		return -EINVAL;
 	}
 
-	if (len > size) {
-		dev_err(&topic->dev,
-			"cannot write more than msg_count messages\n");
-		return -EINVAL;
-	}
-
 	if (mutex_lock_interruptible(&topic->mtx))
 		return -ERESTARTSYS;
 
-	while (topic->len == size) {
+	while (topic->len == topic->msg_size) {
 		mutex_unlock(&topic->mtx);
 		if (file->f_flags & O_NONBLOCK)
 			return -EAGAIN;
 		dev_info(&topic->dev, "writer 0x%8p going to sleep...\n", file);
-		if (wait_event_interruptible(topic->outq, topic->len < size))
+		if (wait_event_interruptible(topic->outq, topic->len == 0))
 			return -ERESTARTSYS;
 		if (mutex_lock_interruptible(&topic->mtx))
 			return -ERESTARTSYS;
 	}
-	dev_info(&topic->dev, "writer 0x%8p woke up!\n", file);
 
 	if (topic->wp >= *off)
 		len = min(len, (size_t)(size - topic->wp));
 	else
 		len = min(len, (size_t)(*off - topic->wp));
 
-	dev_info(&topic->dev, "writer 0x%8p: len = %lu, topic->wp = %u\n", file,
-		 len, topic->wp);
+	dev_info(
+		&topic->dev,
+		"writer 0x%8p woke up! len = %lu, topic->wp = %u, *off = %lld\n",
+		file, len, topic->wp, *off);
 	if (copy_from_user(&topic->buf[topic->wp], buf, len)) {
 		mutex_unlock(&topic->mtx);
 		return -EFAULT;
